@@ -1,5 +1,7 @@
 import hashlib
 import importlib
+import importlib.abc
+import importlib.machinery
 import importlib.util
 import json
 import os
@@ -22,6 +24,33 @@ _source_roots: set[Path] = {Path(__file__).parent / "memes"}
 _loading: ContextVar[Optional[dict[str, Meme]]] = ContextVar(
     "loading_memes", default=None
 )
+
+
+class _SourceLoader(importlib.machinery.SourceFileLoader):
+    """Compile current source without reading or writing bytecode caches."""
+
+    def get_code(self, fullname):
+        filename = self.get_filename(fullname)
+        return self.source_to_code(self.get_data(filename), filename)
+
+
+class _ReloadFinder(importlib.abc.MetaPathFinder):
+    def __init__(self, roots):
+        self.roots = roots
+
+    def find_spec(self, fullname, path=None, target=None):
+        if _loading.get() is None:
+            return None
+        spec = importlib.machinery.PathFinder.find_spec(fullname, path)
+        if (
+            spec
+            and isinstance(spec.loader, importlib.machinery.SourceFileLoader)
+            and spec.origin
+            and any(root in Path(spec.origin).resolve().parents for root in self.roots)
+        ):
+            spec.loader = _SourceLoader(fullname, spec.origin)
+            return spec
+        return None
 
 
 def get_meme_dirs() -> list[Path]:
@@ -66,14 +95,15 @@ def reload_memes():
     candidate: dict[str, Meme] = {}
     token = _loading.set(candidate)
     try:
-        # Timestamp-based bytecode can miss same-size edits within one second.
-        for root in roots:
-            for cached in root.rglob("__pycache__/*.pyc"):
-                cached.unlink()
         for name in previous:
             sys.modules.pop(name, None)
         importlib.invalidate_caches()
-        load_all_memes()
+        finder = _ReloadFinder(roots)
+        sys.meta_path.insert(0, finder)
+        try:
+            load_all_memes()
+        finally:
+            sys.meta_path.remove(finder)
         yield candidate
         _memes = candidate
     except BaseException:
@@ -145,6 +175,9 @@ def load_memes(dir_path: Union[str, Path]):
         module_spec = importlib.util.spec_from_file_location(module_name, module_path)
         if not module_spec or not (module_loader := module_spec.loader):
             continue
+        if isinstance(module_loader, importlib.machinery.SourceFileLoader):
+            module_loader = _SourceLoader(module_name, module_path)
+            module_spec.loader = module_loader
         try:
             module = importlib.util.module_from_spec(module_spec)
             sys.modules[module_name] = module

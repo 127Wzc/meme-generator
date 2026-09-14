@@ -34,11 +34,13 @@ COPY --from=tmp /tmp/requirements.txt /app/requirements.txt
 COPY ./resources/fonts/* /usr/share/fonts/meme-fonts/
 
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends fontconfig fonts-noto-color-emoji libgl1 libglx-mesa0 libgl1-mesa-dri libegl1 libegl-mesa0 gettext \
+  && apt-get install -y --no-install-recommends fontconfig fonts-noto-color-emoji libgl1 libglx-mesa0 libgl1-mesa-dri libegl1 libegl-mesa0 gettext libcairo2 build-essential libcairo2-dev pkg-config \
   && fc-cache -fv \
-  && apt-get purge -y --auto-remove \
+  && pip install --no-cache-dir --upgrade -r /app/requirements.txt \
+  && pip install --no-cache-dir pycairo==1.29.1 \
+  && apt-get purge -y --auto-remove build-essential libcairo2-dev pkg-config \
   && rm -rf /var/lib/apt/lists/* \
-  && pip install --no-cache-dir --upgrade -r /app/requirements.txt
+  && python -c "import cairo; surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, 1, 1); cairo.Context(surface).paint()"
 
 COPY ./meme_generator /app/meme_generator
 
