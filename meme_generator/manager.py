@@ -1,8 +1,15 @@
+import hashlib
 import importlib
 import importlib.util
+import json
+import os
 import pkgutil
+import sys
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
+from types import ModuleType
 from typing import Optional, Union
 
 from .config import meme_config
@@ -11,6 +18,72 @@ from .log import logger
 from .meme import CommandShortcut, Meme, MemeArgsType, MemeFunction, MemeParamsType
 
 _memes: dict[str, Meme] = {}
+_source_roots: set[Path] = {Path(__file__).parent / "memes"}
+_loading: ContextVar[Optional[dict[str, Meme]]] = ContextVar(
+    "loading_memes", default=None
+)
+
+
+def get_meme_dirs() -> list[Path]:
+    value = os.environ.get("MEME_DIRS")
+    if value is None:
+        return meme_config.meme.meme_dirs
+    directories = json.loads(value or "[]")
+    if not isinstance(directories, list) or not all(
+        isinstance(directory, str) and directory.strip() for directory in directories
+    ):
+        raise ValueError("MEME_DIRS must be a JSON array of directory paths")
+    return [Path(directory) for directory in directories]
+
+
+def load_all_memes():
+    if meme_config.meme.load_builtin_memes:
+        for module in pkgutil.iter_modules([str(Path(__file__).parent / "memes")]):
+            if not module.name.startswith("_"):
+                load_meme(f"meme_generator.memes.{module.name}")
+    for directory in get_meme_dirs():
+        if directory.is_dir():
+            load_memes(directory)
+
+
+@contextmanager
+def reload_memes():
+    """Build a fresh registry; publish only after the caller's preparation succeeds."""
+    global _memes
+    roots = [*_source_roots, *get_meme_dirs()]
+    roots = [root.resolve() for root in roots]
+
+    def belongs(module):
+        filename = getattr(module, "__file__", None)
+        if not filename:
+            return False
+        parents = Path(filename).resolve().parents
+        return any(root in parents for root in roots)
+
+    previous = {
+        name: module for name, module in list(sys.modules.items()) if belongs(module)
+    }
+    candidate: dict[str, Meme] = {}
+    token = _loading.set(candidate)
+    try:
+        # Timestamp-based bytecode can miss same-size edits within one second.
+        for root in roots:
+            for cached in root.rglob("__pycache__/*.pyc"):
+                cached.unlink()
+        for name in previous:
+            sys.modules.pop(name, None)
+        importlib.invalidate_caches()
+        load_all_memes()
+        yield candidate
+        _memes = candidate
+    except BaseException:
+        for name, module in list(sys.modules.items()):
+            if belongs(module):
+                sys.modules.pop(name, None)
+        sys.modules.update(previous)
+        raise
+    finally:
+        _loading.reset(token)
 
 
 def path_to_module_name(path: Path) -> str:
@@ -30,12 +103,34 @@ def load_meme(module_path: Union[str, Path]):
     try:
         importlib.import_module(module_name)
     except Exception as e:
+        if _loading.get() is not None:
+            raise
         logger.opt(colors=True, exception=e).error(f"Failed to import {module_path}!")
 
 
 def load_memes(dir_path: Union[str, Path]):
-    if isinstance(dir_path, Path):
-        dir_path = str(dir_path.resolve())
+    directory = Path(dir_path).resolve()
+    if not directory.is_dir():
+        return
+    if not any(
+        root == directory or root in directory.parents for root in _source_roots
+    ):
+        _source_roots.difference_update(
+            root for root in list(_source_roots) if directory in root.parents
+        )
+        _source_roots.add(directory)
+    dir_path = str(directory)
+    # Keep external packages (and relative helper imports) out of public names.
+    namespace = "_meme_external_" + hashlib.sha256(dir_path.encode()).hexdigest()
+    if namespace not in sys.modules:
+        package = ModuleType(namespace)
+        package.__path__ = [dir_path]
+        package.__package__ = namespace
+        package.__file__ = str(directory / "__init__.py")
+        package.__spec__ = importlib.util.spec_from_loader(
+            namespace, loader=None, is_package=True
+        )
+        sys.modules[namespace] = package
 
     for module_info in pkgutil.iter_modules([dir_path]):
         if module_info.name.startswith("_"):
@@ -46,15 +141,34 @@ def load_memes(dir_path: Union[str, Path]):
             continue
         if not (module_path := module_spec.origin):
             continue
-        if not (module_loader := module_spec.loader):
+        module_name = f"{namespace}.{module_info.name}"
+        module_spec = importlib.util.spec_from_file_location(module_name, module_path)
+        if not module_spec or not (module_loader := module_spec.loader):
             continue
         try:
             module = importlib.util.module_from_spec(module_spec)
+            sys.modules[module_name] = module
             module_loader.exec_module(module)
         except Exception as e:
+            sys.modules.pop(module_name, None)
+            if _loading.get() is not None:
+                raise
             logger.opt(colors=True, exception=e).error(
                 f"Failed to import {module_path}!"
             )
+
+    # Repositories may group meme packages in directories without __init__.py.
+    # Packages themselves own their imports; do not execute their helpers twice.
+    directory = Path(dir_path)
+    if directory.is_dir():
+        for child in sorted(directory.iterdir()):
+            if (
+                child.is_dir()
+                and not child.name.startswith(("_", "."))
+                and not child.is_symlink()
+                and not (child / "__init__.py").exists()
+            ):
+                load_memes(child)
 
 
 def add_meme(
@@ -73,7 +187,10 @@ def add_meme(
     date_created: datetime = datetime(2021, 5, 4),
     date_modified: datetime = datetime.now(),
 ):
-    if key in _memes:
+    registry = _loading.get()
+    if registry is None:
+        registry = _memes
+    if key in registry:
         logger.warning(f'Meme with key "{key}" already exists!')
         return
 
@@ -94,7 +211,7 @@ def add_meme(
         date_modified=date_modified,
     )
 
-    _memes[key] = meme
+    registry[key] = meme
 
 
 def get_meme(key: str) -> Meme:

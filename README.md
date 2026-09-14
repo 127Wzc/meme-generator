@@ -41,6 +41,28 @@ _✨ 表情包生成器，用于制作各种沙雕表情包 ✨_
 - [anyliew/meme_emoji](https://github.com/anyliew/meme_emoji) 更多热门表情包模板
 - [LRZ9712/tudou-meme](https://github.com/LRZ9712/tudou-meme) 手搓的一些表情包模版
 
+## 聚合信息与资源重载
+
+启动时自动生成并覆盖 `data/memes/static/` 下的两个 JSON（容器内为 `/app/data/memes/static/`）：
+
+- `GET /memes/static/infos.json`：`{ key: info }`，与单项 info 接口一致。
+- `GET /memes/static/keyMap.json`：`{ 关键词: key }`。
+
+`MEME_DIRS` 支持 JSON 目录列表，例如 `MEME_DIRS='["/meme/contrib/memes","/meme/emoji/emoji"]'`。
+不存在的目录会跳过，容器默认 `[]`，只加载内置模板。非容器运行未设置该变量时，沿用配置文件的 `meme_dirs`（默认空列表）。
+
+设置环境变量 `MEME_RELOAD_TOKEN` 后，可重新加载内置及 `meme_dirs` 下的本地模板，
+同步更新生成路由和两个 JSON；不执行 Git 拉取。本地 HTTP 可直接调用：
+
+```sh
+curl -X POST http://127.0.0.1:2233/memes/reload \
+  -H "Authorization: Bearer $MEME_RELOAD_TOKEN"
+```
+
+成功返回 `{"success": true, "count": 123}`。未设置密钥时关闭重载接口，
+鉴权通过后每 30 秒最多尝试一次。重载会阻塞新请求，适用于默认单进程部署。
+两个 JSON 接口无需鉴权；客户端仍需刷新本地缓存。
+
 ## 已知问题
 
 - Windows 下程序无报错退出

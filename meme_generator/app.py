@@ -1,9 +1,25 @@
 import json
+import os
+import secrets
+import tempfile
+from contextlib import asynccontextmanager
 from datetime import datetime
+from pathlib import Path
+from time import monotonic
 from typing import Any, Literal, Optional
 
 import filetype
-from fastapi import Depends, FastAPI, Form, HTTPException, Response, UploadFile
+from fastapi import (
+    APIRouter,
+    Depends,
+    FastAPI,
+    Form,
+    Header,
+    HTTPException,
+    Response,
+    UploadFile,
+)
+from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, ValidationError
 
 from meme_generator.compat import model_dump, model_json_schema, type_validate_python
@@ -14,12 +30,25 @@ from meme_generator.exception import (
     NoSuchMeme,
 )
 from meme_generator.log import LOGGING_CONFIG, setup_logger
-from meme_generator.manager import get_meme, get_meme_keys, get_memes
+from meme_generator.manager import get_meme, get_meme_keys, get_memes, reload_memes
 from meme_generator.meme import CommandShortcut, Meme, MemeArgsModel, ParserOption
 from meme_generator.utils import MemeProperties, render_meme_list, run_sync
 from meme_generator.version import __version__
 
-app = FastAPI()
+STATIC_DIR = Path("data/memes/static")
+RELOAD_COOLDOWN_SECONDS = 30
+_reload_next_allowed = 0.0
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    publish_memes(get_memes())
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
+_generation_routes = []
+_static_documents: dict[str, str] = {}
 
 
 class MemeArgsResponse(BaseModel):
@@ -47,7 +76,7 @@ class MemeInfoResponse(BaseModel):
     date_modified: datetime
 
 
-def register_router(meme: Meme):
+def register_router(meme: Meme, router: APIRouter):
     if args_type := meme.params_type.args_type:
         args_model = args_type.args_model
     else:
@@ -65,7 +94,7 @@ def register_router(meme: Meme):
             raise HTTPException(status_code=552, detail=e.message)
         return model
 
-    @app.post(f"/memes/{meme.key}/")
+    @router.post(f"/memes/{meme.key}/")
     async def _(
         images: list[UploadFile] = [],
         texts: list[str] = meme.params_type.default_texts,
@@ -97,19 +126,98 @@ class MemeKeyWithProperties(BaseModel):
     labels: list[Literal["new", "hot"]] = []
 
 
-default_meme_list = [
-    MemeKeyWithProperties(meme_key=meme.key)
-    for meme in sorted(get_memes(), key=lambda meme: meme.key)
-]
-
-
 class RenderMemeListRequest(BaseModel):
-    meme_list: list[MemeKeyWithProperties] = default_meme_list
+    meme_list: Optional[list[MemeKeyWithProperties]] = None
     text_template: str = "{keywords}"
     add_category_icon: bool = True
 
 
+def meme_info(meme: Meme) -> MemeInfoResponse:
+    args_type_response = None
+    if args_type := meme.params_type.args_type:
+        args_model = args_type.args_model
+        args_type_response = MemeArgsResponse(
+            args_model=model_json_schema(args_model),
+            args_examples=[model_dump(example) for example in args_type.args_examples],
+            parser_options=args_type.parser_options,
+        )
+
+    return MemeInfoResponse(
+        key=meme.key,
+        params_type=MemeParamsResponse(
+            min_images=meme.params_type.min_images,
+            max_images=meme.params_type.max_images,
+            min_texts=meme.params_type.min_texts,
+            max_texts=meme.params_type.max_texts,
+            default_texts=meme.params_type.default_texts,
+            args_type=args_type_response,
+        ),
+        keywords=meme.keywords,
+        shortcuts=meme.shortcuts,
+        tags=meme.tags,
+        date_created=meme.date_created,
+        date_modified=meme.date_modified,
+    )
+
+
 def register_routers():
+    if getattr(app.state, "routers_registered", False):
+        return
+    app.state.routers_registered = True
+
+    @app.get("/memes/static/infos.json")
+    async def infos_document():
+        return Response(
+            _static_documents["infos.json"],
+            media_type="application/json",
+            headers={"Cache-Control": "no-cache"},
+        )
+
+    @app.get("/memes/static/keyMap.json")
+    async def keywords_document():
+        return Response(
+            _static_documents["keyMap.json"],
+            media_type="application/json",
+            headers={"Cache-Control": "no-cache"},
+        )
+
+    @app.post("/memes/reload")
+    async def reload_resources(authorization: Optional[str] = Header(default=None)):
+        global _reload_next_allowed
+        token = os.environ.get("MEME_RELOAD_TOKEN", "")
+        if not token:
+            raise HTTPException(status_code=503, detail="Meme reload is disabled")
+        scheme, _, supplied_token = (authorization or "").partition(" ")
+        if scheme.lower() != "bearer" or not secrets.compare_digest(
+            supplied_token.encode("utf-8"), token.encode("utf-8")
+        ):
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid reload token",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        now = monotonic()
+        if now < _reload_next_allowed:
+            raise HTTPException(
+                status_code=429,
+                detail="Meme reload is cooling down",
+                headers={"Retry-After": str(int(_reload_next_allowed - now) + 1)},
+            )
+        # Reserve the interval before loading so failed attempts are limited too.
+        # Reload runs without yielding on the single server event loop.
+        _reload_next_allowed = now + RELOAD_COOLDOWN_SECONDS
+        try:
+            with reload_memes() as candidate:
+                publish_memes(list(candidate.values()))
+        except Exception as exc:
+            from meme_generator.log import logger
+
+            logger.exception("Failed to reload memes")
+            raise HTTPException(
+                status_code=500, detail="Meme reload failed; previous registry retained"
+            ) from exc
+        return {"success": True, "count": len(candidate)}
+
     @app.post("/memes/render_list")
     def _(params: RenderMemeListRequest = RenderMemeListRequest()):
         try:
@@ -118,7 +226,14 @@ def register_routers():
                     get_meme(p.meme_key),
                     MemeProperties(disabled=p.disabled, labels=p.labels),
                 )
-                for p in params.meme_list
+                for p in (
+                    params.meme_list
+                    if params.meme_list is not None
+                    else [
+                        MemeKeyWithProperties(meme_key=m.key)
+                        for m in sorted(get_memes(), key=lambda m: m.key)
+                    ]
+                )
             ]
         except NoSuchMeme as e:
             raise HTTPException(status_code=e.status_code, detail=e.message)
@@ -147,33 +262,7 @@ def register_routers():
         except NoSuchMeme as e:
             raise HTTPException(status_code=e.status_code, detail=e.message)
 
-        args_type_response = None
-        if args_type := meme.params_type.args_type:
-            args_model = args_type.args_model
-            args_type_response = MemeArgsResponse(
-                args_model=model_json_schema(args_model),
-                args_examples=[
-                    model_dump(example) for example in args_type.args_examples
-                ],
-                parser_options=args_type.parser_options,
-            )
-
-        return MemeInfoResponse(
-            key=meme.key,
-            params_type=MemeParamsResponse(
-                min_images=meme.params_type.min_images,
-                max_images=meme.params_type.max_images,
-                min_texts=meme.params_type.min_texts,
-                max_texts=meme.params_type.max_texts,
-                default_texts=meme.params_type.default_texts,
-                args_type=args_type_response,
-            ),
-            keywords=meme.keywords,
-            shortcuts=meme.shortcuts,
-            tags=meme.tags,
-            date_created=meme.date_created,
-            date_modified=meme.date_modified,
-        )
+        return meme_info(meme)
 
     @app.get("/memes/{key}/preview")
     async def _(key: str):
@@ -187,8 +276,58 @@ def register_routers():
         media_type = str(filetype.guess_mime(content)) or "text/plain"
         return Response(content=content, media_type=media_type)
 
-    for meme in sorted(get_memes(), key=lambda meme: meme.key):
-        register_router(meme)
+
+def publish_memes(memes: list[Meme]):
+    """Prepare routes and both documents before replacing the active snapshot."""
+    global _generation_routes, _static_documents
+    router = APIRouter()
+    infos = {}
+    key_map = {}
+    for meme in sorted(memes, key=lambda meme: meme.key):
+        register_router(meme, router)
+        infos[meme.key] = jsonable_encoder(meme_info(meme))
+        for keyword in meme.keywords:
+            key_map[keyword] = meme.key
+    documents = {
+        "infos.json": json.dumps(infos, ensure_ascii=False),
+        "keyMap.json": json.dumps(key_map, ensure_ascii=False),
+    }
+    STATIC_DIR.mkdir(parents=True, exist_ok=True)
+    staged = {}
+    previous = {}
+    replaced = []
+    try:
+        for name, content in documents.items():
+            destination = STATIC_DIR / name
+            previous[name] = destination.read_bytes() if destination.exists() else None
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=STATIC_DIR, delete=False
+            ) as temporary:
+                staged[name] = Path(temporary.name)
+                temporary.write(content)
+        for name, temporary in staged.items():
+            temporary.replace(STATIC_DIR / name)
+            replaced.append(name)
+    except BaseException:
+        for name in replaced:
+            destination = STATIC_DIR / name
+            if previous[name] is None:
+                destination.unlink()
+            else:
+                destination.write_bytes(previous[name])
+        raise
+    finally:
+        for temporary in staged.values():
+            temporary.unlink(missing_ok=True)
+    app.router.routes = [
+        route for route in app.router.routes if route not in _generation_routes
+    ] + router.routes
+    _generation_routes = list(router.routes)
+    _static_documents = documents
+    app.openapi_schema = None
+
+
+register_routers()
 
 
 def run_server():
